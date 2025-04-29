@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Генератор импульсов v3‑u6 (модифицирован)
-— ... (все предыдущие фичи) ...
-— ДОБАВЛЕНО: Загрузка данных из CSV и XLSX (формат как при экспорте)
-"""
 
 from __future__ import annotations
 import re
