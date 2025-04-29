@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Генератор импульсов v3‑u5 (модифицирован)
-— каждый сигнал рисуется в одном окне, друг‑под‑другом
-— тики оси X выводят число + единицу измерения (ns, µs…)
-— добавлена настройка шага тиков оси X (e.g., '10ns', '0.5us')
-— возможность загрузки списка сигналов из файла (форматы PULSE и PWL)
-— можно менять порядок сигналов перетаскиванием мышью или Ctrl+↑/↓
-— добавлена возможность выбора режима ввода параметров: либо T_HIGH и T_LOW, либо T_PULSE_WIDTH и T_PERIOD
-— ДОБАВЛЕНО: Таблица для редактирования точек выбранного сигнала
-— ДОБАВЛЕНО: Кнопка для обновления графика по данным из таблицы
-— ДОБАВЛЕНО: Скроллбар для таблицы точек
+Генератор импульсов v3‑u6 (модифицирован)
+— ... (все предыдущие фичи) ...
+— ДОБАВЛЕНО: Загрузка данных из CSV и XLSX (формат как при экспорте)
 """
 
 from __future__ import annotations
@@ -23,16 +16,22 @@ import matplotlib.ticker as ticker
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
 import csv
+import os # Для работы с путями и расширениями
+
 try:
-    from openpyxl import Workbook
+    from openpyxl import load_workbook # Используем load_workbook для чтения
     from openpyxl.utils import get_column_letter
     from openpyxl.styles import Font
+    from openpyxl import Workbook # Оставляем Workbook для экспорта
     XLSX_SUPPORT = True
 except ImportError:
     XLSX_SUPPORT = False
+    print("Warning: openpyxl library not found. XLSX import/export will be disabled.")
+    print("Install it using: pip install openpyxl")
+
 
 # ───── Вспомогательные функции времени (ОБНОВЛЕНО) ─────
-
+# ... (код parse_time, fmt, autoscale, unit_formatter без изменений) ...
 # Словарь для ПАРСИНГА (регистронезависимый)
 # Ключи: 'f', 'p', 'n', 'u', 'm', 'k', 'meg', 'g', ''
 # Добавим поддержку 'µ' как 'u'
@@ -56,10 +55,16 @@ def parse_time(s: str) -> float:
     if not m:
         # Если regex не сработал, попробуем просто как float (для чисел без единиц)
         try:
-            v = float(s_orig)
+            # Проверим, не является ли строка просто числом (включая научную нотацию)
+            # Используем более строгую проверку, чтобы не парсить 'abc' как 0
+            try:
+                v = float(s_orig)
+            except ValueError:
+                 # Если это не чистое число, то это ошибка формата
+                 raise ValueError(f'Неверный формат времени: "{s_orig}"')
+
             # Время не может быть отрицательным, но для промежуточных расчетов или напряжения - может
             # Оставим проверку на отрицательность там, где это семантически нужно (TD, TR и т.д.)
-            # if v < 0: raise ValueError("Время не может быть отрицательным") # Убрали глобальную проверку
             return v
         except ValueError:
             raise ValueError(f'Неверный формат времени: "{s_orig}"')
@@ -86,12 +91,6 @@ def parse_time(s: str) -> float:
         raise ValueError(f'Неизвестная единица измерения: "{u_str}" в "{s_orig}"')
 
     result = v * multiplier
-    # Проверка на отрицательность должна быть в вызывающем коде, где это уместно
-    # if result < 0:
-    #     # Проверим контекст TD, TR, TF, TH, TL, N - они не могут быть < 0
-    #     # V0, V1 могут быть отрицательными
-    #     # Лучше проверять в _read_signal_data
-    #     pass
     return result
 
 # Словарь для ФОРМАТИРОВАНИЯ (используем 'u', 'M', 'G')
@@ -180,6 +179,7 @@ def unit_formatter(unit: str):
     # Форматтер для Matplotlib. '{x:g}' автоматически выбирает формат числа.
     return ticker.FuncFormatter(lambda x, pos: f'{x:g}{unit_str}')
 
+
 # ───── Data class сигнала ─────
 @dataclass
 class Signal:
@@ -191,15 +191,23 @@ class Signal:
     tp: float = field(init=False)
     total_time: float = field(init=False)
     scale: float = field(init=False); unit: str = field(init=False)
-    # Хранилище для точек, если сигнал был изменен через таблицу
+    # Хранилище для точек, если сигнал был изменен через таблицу или загружен из PWL/CSV/XLSX
     # Если None, используются параметры PULSE. Иначе - эти точки.
     pwl_points: tuple[list[float], list[float]] | None = None
 
     def __post_init__(self):
-        self.update()
+        # Если pwl_points уже установлены (например, при загрузке),
+        # не вызываем update() сразу, чтобы не сбросить их.
+        # Вызовем update() только если pwl_points не заданы.
+        if self.pwl_points is None:
+            self.update()
+        else:
+            # Если pwl_points заданы, обновим только total_time и scale/unit
+            self._update_time_scale_from_pwl()
+
 
     def update(self):
-        """Пересчитывает дополнительные параметры сигнала. Сбрасывает pwl_points."""
+        """Пересчитывает дополнительные параметры сигнала на основе PULSE. Сбрасывает pwl_points."""
         self.TR = max(1e-15, self.TR) # Избегаем нулевых времен для корректного расчета PW
         self.TF = max(1e-15, self.TF)
         self.TH = max(0, self.TH)
@@ -211,35 +219,64 @@ class Signal:
         if self.N > 0 and self.tp <= 1e-15:
             print(f"Warning: Signal '{self.Name}' has N > 0 but calculated period (tp) is near zero. Setting N=0.")
             # Можно установить N=0 или задать минимальный tp
-            self.tp = 1e-9 # Например, 1 нс по умолчанию, если все времена были 0
-            # self.N = 0 # Альтернатива - обнулить N
+            # self.tp = 1e-9 # Например, 1 нс по умолчанию, если все времена были 0
+            self.N = 0 # Альтернатива - обнулить N
 
         self.total_time = self.TD if self.N == 0 else self.TD + self.N * self.tp
         self.scale, self.unit = autoscale(self.total_time if self.total_time > 0 else 1e-9) # Масштаб по умолчанию если время 0
         # Сбрасываем PWL представление при обновлении параметров
         self.pwl_points = None
 
+    def _update_time_scale_from_pwl(self):
+        """Обновляет total_time, scale, unit на основе pwl_points."""
+        if self.pwl_points and self.pwl_points[0]:
+            self.total_time = self.pwl_points[0][-1]
+        else:
+            self.total_time = 0
+        self.scale, self.unit = autoscale(self.total_time if self.total_time > 0 else 1e-9)
+
+
     def set_pwl_points(self, times: list[float], voltages: list[float]):
-        """Устанавливает точки PWL и обновляет total_time."""
+        """Устанавливает точки PWL и обновляет total_time, scale, unit."""
         if not times:
             self.pwl_points = None
             self.total_time = 0
         else:
-            # Убедимся, что время монотонно возрастает
-            valid_times = [times[0]]
-            valid_voltages = [voltages[0]]
-            for i in range(1, len(times)):
-                if times[i] > valid_times[-1]:
-                    valid_times.append(times[i])
-                    valid_voltages.append(voltages[i])
-                elif times[i] == valid_times[-1]:
-                    # Если время то же, обновляем напряжение последней точки
-                    valid_voltages[-1] = voltages[i]
-                # else: Игнорируем точки с меньшим временем (ошибка данных)
+            # Убедимся, что время монотонно возрастает и нет дубликатов (кроме обновления напряжения)
+            valid_times = []
+            valid_voltages = []
+            last_t = -float('inf') # Гарантированно меньше первого времени
 
-            self.pwl_points = (valid_times, valid_voltages)
-            self.total_time = valid_times[-1] if valid_times else 0
-        self.scale, self.unit = autoscale(self.total_time if self.total_time > 0 else 1e-9)
+            for i in range(len(times)):
+                t = times[i]
+                v = voltages[i]
+
+                if t > last_t:
+                    valid_times.append(t)
+                    valid_voltages.append(v)
+                    last_t = t
+                elif t == last_t:
+                     # Если время то же, обновляем напряжение последней точки
+                    if valid_voltages:
+                        valid_voltages[-1] = v
+                    # Не обновляем last_t, чтобы следующая точка с таким же временем тоже обновила напряжение
+                else: # t < last_t
+                    # Игнорируем точки с меньшим временем (ошибка данных)
+                    print(f"Warning: Ignored PWL point for signal '{self.Name}' due to non-monotonic time: ({fmt(t)}, {v:g}) after ({fmt(last_t)})")
+                    continue
+
+            # Убедимся, что у нас есть хотя бы одна точка
+            if not valid_times:
+                 print(f"Warning: No valid PWL points found for signal '{self.Name}' after validation.")
+                 self.pwl_points = None
+                 self.total_time = 0
+            else:
+                self.pwl_points = (valid_times, valid_voltages)
+                # total_time, scale, unit обновятся в _update_time_scale_from_pwl()
+
+        # Обновляем производные поля
+        self._update_time_scale_from_pwl()
+
 
     def get_waveform_points(self, xmax: float | None = None, force_pulse: bool = False) -> tuple[list[float], list[float]]:
         """
@@ -258,28 +295,23 @@ class Signal:
             times = list(times)
             voltages = list(voltages)
             theoretical_end = times[-1] if times else 0
-            # print(f"DEBUG: Signal '{self.Name}' using PWL points for get_waveform_points.") # Отладочный вывод
         else:
             # Генерируем точки из параметров PULSE
-            # print(f"DEBUG: Signal '{self.Name}' using PULSE params for get_waveform_points (force_pulse={force_pulse}).") # Отладочный вывод
             times: list[float] = []
             voltages: list[float] = []
             t_cur = 0.0
 
-            # Начальная точка
+            # Начальная точка (всегда добавляем 0, V0)
             times.append(0.0)
             voltages.append(self.V0)
 
             # Задержка (Delay)
-            if self.TD > 0:
+            if self.TD > 1e-15: # Только если задержка значима
                 t_cur = self.TD # Время конца задержки
-                # Проверим, что не добавляем точку с тем же временем, если TD=0
-                if not times or abs(times[-1] - t_cur) > 1e-15:
-                    times.append(t_cur)
-                    voltages.append(self.V0)
-                else: # Если TD=0, просто обновим напряжение начальной точки, если нужно (хотя V0 уже там)
-                     if voltages: voltages[-1] = self.V0
-
+                # Добавляем точку перед началом импульсов
+                times.append(t_cur)
+                voltages.append(self.V0)
+            #else: t_cur = 0.0 - уже установлено
 
             # Импульсы
             if self.N > 0 and self.tp > 1e-15: # Проверяем, что период не нулевой
@@ -289,17 +321,17 @@ class Signal:
                     if self.TR > 1e-15: # Добавляем точку только если время > 0
                         times.append(t_rise_end)
                         voltages.append(self.V1)
+                    else: # Если TR=0, напряжение меняется мгновенно в t_cur
+                        if abs(times[-1] - t_cur) < 1e-15: voltages[-1] = self.V1 # Обновляем предыдущую точку
+                        else: times.append(t_cur); voltages.append(self.V1) # Или добавляем новую, если время разное
                     t_cur = t_rise_end
 
                     # High time
                     t_high_end = t_cur + self.TH
                     if self.TH > 1e-15:
-                        # Добавляем точку только если время изменилось
-                        if not times or abs(times[-1] - t_high_end) > 1e-15:
-                            times.append(t_high_end)
-                            voltages.append(self.V1)
-                        elif voltages: # Если время то же, обновляем напряжение
-                            voltages[-1] = self.V1
+                        times.append(t_high_end)
+                        voltages.append(self.V1)
+                    #else: напряжение V1 уже установлено
                     t_cur = t_high_end
 
                     # Fall time
@@ -307,82 +339,92 @@ class Signal:
                     if self.TF > 1e-15:
                         times.append(t_fall_end)
                         voltages.append(self.V0)
+                    else: # Если TF=0, напряжение меняется мгновенно в t_cur
+                        if abs(times[-1] - t_cur) < 1e-15: voltages[-1] = self.V0 # Обновляем предыдущую точку
+                        else: times.append(t_cur); voltages.append(self.V0) # Или добавляем новую
                     t_cur = t_fall_end
 
                     # Low time
                     t_low_end = t_cur + self.TL
                     if self.TL > 1e-15:
-                         # Добавляем точку только если время изменилось
-                        if not times or abs(times[-1] - t_low_end) > 1e-15:
-                            times.append(t_low_end)
-                            voltages.append(self.V0)
-                        elif voltages: # Если время то же, обновляем напряжение
-                             voltages[-1] = self.V0
+                         times.append(t_low_end)
+                         voltages.append(self.V0)
+                    #else: напряжение V0 уже установлено
                     t_cur = t_low_end # Время на конец периода i
 
             # Рассчитаем теоретическое время конца последнего импульса/задержки
             theoretical_end = self.TD if self.N == 0 else self.TD + self.N * self.tp
 
-            # Добавляем конечную точку, если она отличается от последней добавленной
+            # Убедимся, что последняя точка соответствует V0 на theoretical_end
             if not times or abs(times[-1] - theoretical_end) > 1e-12:
-                 # Конечный уровень после N импульсов или задержки - V0
+                 # Добавляем конечную точку, если ее еще нет
                  times.append(theoretical_end)
                  voltages.append(self.V0)
             elif voltages: # Если время совпадает, убедимся, что напряжение = V0
                 voltages[-1] = self.V0
 
-
         # --- Обработка xmax и очистка (общая для PWL и PULSE) ---
+        final_times = []
+        final_voltages = []
+
+        # Добавляем точку (0, V0) если ее нет (важно для PWL, где она может отсутствовать)
+        if not times or times[0] > 1e-15:
+            # Определяем V0 из PWL, если возможно
+            start_voltage = voltages[0] if use_pwl and voltages else self.V0
+            final_times.append(0.0)
+            final_voltages.append(start_voltage)
+
+        # Копируем существующие точки, удаляя дубликаты времени (обновляя напряжение)
+        if times:
+            last_t = -float('inf')
+            for t, v in zip(times, voltages):
+                # Игнорируем точки до 0
+                if t < -1e-15: continue
+
+                # Округляем очень близкие к 0 значения до 0
+                t_proc = 0.0 if abs(t) < 1e-15 else t
+
+                if abs(t_proc - last_t) > 1e-15: # Новое время
+                    final_times.append(t_proc)
+                    final_voltages.append(v)
+                    last_t = t_proc
+                else: # То же время, обновляем напряжение
+                    if final_voltages:
+                        final_voltages[-1] = v
+                    # last_t не меняем
 
         # Обработка xmax: продление сигнала до xmax, если необходимо
         if xmax is not None and theoretical_end < xmax:
-            last_v = voltages[-1] if voltages else self.V0 # Напряжение в theoretical_end
-            # Если последняя точка уже на theoretical_end, просто добавляем xmax
-            if times and abs(times[-1] - theoretical_end) < 1e-12 :
-                 # Проверим, нужно ли вообще продлевать (xmax может быть равен theoretical_end)
-                 if abs(xmax - theoretical_end) > 1e-12:
-                     times.append(xmax)
-                     voltages.append(last_v)
-            # Если последняя точка не на theoretical_end (например, из-за нулевых интервалов)
-            # Или если xmax больше theoretical_end, добавляем обе точки
-            elif abs(xmax - theoretical_end) > 1e-12:
-                 # Добавим точку theoretical_end, если ее еще нет или она не последняя
-                 if not times or abs(times[-1] - theoretical_end) > 1e-12:
-                     times.append(theoretical_end)
-                     voltages.append(last_v)
-                 elif voltages: # Если последняя точка на theoretical_end, убедимся в правильном напряжении
-                      voltages[-1] = last_v
+            last_v = final_voltages[-1] if final_voltages else self.V0
+
+            # Если последняя точка УЖЕ на theoretical_end (или очень близко)
+            if final_times and abs(final_times[-1] - theoretical_end) < 1e-12:
+                # Продлеваем до xmax, если он дальше
+                if xmax > final_times[-1] + 1e-12:
+                    final_times.append(xmax)
+                    final_voltages.append(last_v)
+            # Если последняя точка НЕ на theoretical_end ИЛИ xmax дальше theoretical_end
+            elif xmax > theoretical_end + 1e-12:
+                 # Добавляем точку theoretical_end, если ее еще нет ИЛИ она не последняя
+                 if not final_times or abs(final_times[-1] - theoretical_end) > 1e-12:
+                     final_times.append(theoretical_end)
+                     final_voltages.append(last_v)
+                 elif final_voltages: # Если последняя точка на theoretical_end, убедимся в правильном напряжении
+                      final_voltages[-1] = last_v
                  # Добавим точку xmax
-                 times.append(xmax)
-                 voltages.append(last_v)
+                 final_times.append(xmax)
+                 final_voltages.append(last_v)
 
-        # Очистка от дубликатов времени (могут возникнуть из-за нулевых интервалов или PWL)
-        clean_times = []
-        clean_voltages = []
-        if times:
-            last_t = -1.0 # Гарантированно меньше первого времени (>=0)
-            for t, v in zip(times, voltages):
-                # Добавляем точку только если время изменилось
-                if abs(t - last_t) > 1e-15: # Используем малый допуск
-                    clean_times.append(t)
-                    clean_voltages.append(v)
-                    last_t = t
-                else:
-                    # Если время то же, обновляем напряжение последней точки
-                    if clean_voltages:
-                        clean_voltages[-1] = v
+        # Если после всех манипуляций список пуст, вернем точку (0, V0)
+        if not final_times:
+            final_times.append(0.0)
+            final_voltages.append(self.V0)
+            if xmax is not None and xmax > 1e-15:
+                final_times.append(xmax)
+                final_voltages.append(self.V0)
 
-        # Убедимся, что есть хотя бы начальная точка 0, V0, если генерация дала пустой список
-        if not clean_times:
-             clean_times.append(0.0)
-             clean_voltages.append(self.V0)
-             if xmax is not None and xmax > 0:
-                 # Добавим точку xmax, если она отличается от 0
-                 if abs(xmax - 0.0) > 1e-15:
-                     clean_times.append(xmax)
-                     clean_voltages.append(self.V0)
+        return final_times, final_voltages
 
-        return clean_times, clean_voltages
 
 
 # ───── Главное приложение ─────
@@ -393,7 +435,7 @@ class PulseApp(ttk.Frame):
     def __init__(self, master: tk.Tk):
         super().__init__(master)
         self.pack(fill='both', expand=True)
-        master.title('Impulse generator v3‑u5 (с ред. таблицы)')
+        master.title('Impulse generator v3‑u6 (с CSV/XLSX импортом)') # Обновил версию
         master.minsize(850, 650) # Увеличим мин. размер
         self.signals: list[Signal] = []
         self._drag_start_index = None
@@ -403,8 +445,9 @@ class PulseApp(ttk.Frame):
         self._layout()
         self._mpl()
         # Флаг, указывающий, что данные для выбранного сигнала взяты из таблицы
-        self.updated_from_table_index = None
+        # self.updated_from_table_index = None # Заменено на проверку signal.pwl_points
 
+    # ... (методы _style, _layout, _mpl, on_mode_change без изменений) ...
     def _style(self):
         st = ttk.Style()
         st.theme_use('clam')
@@ -550,22 +593,41 @@ class PulseApp(ttk.Frame):
             # Обновляем значения в полях для текущего выбранного сигнала
             idx = self._get_selected_index()
             if idx is not None and 0 <= idx < len(self.signals):
-                self._update_entries(self.signals[idx])
+                # Пересчитываем значения в полях, только если сигнал НЕ на основе PWL
+                if self.signals[idx].pwl_points is None:
+                     self._update_entries(self.signals[idx])
+                # Если на основе PWL, поля все равно показывают базовые параметры,
+                # но можно их обновить, если хотим, чтобы они отражали режим
+                # self._update_entries(self.signals[idx]) # Раскомментировать, если нужно обновлять поля и для PWL сигналов
+
 
     def _read_signal_data(self) -> Signal:
         """Читает данные из полей ввода параметров."""
         v = {k: self.ent[k].get().strip() for k, _ in self.FIELDS}
         try:
             name = v['Name'] if v['Name'] else f'Signal {len(self.signals)+1}'
-            v0 = float(v['V0'] or 0)
-            v1 = float(v['V1'] or 1)
+            # Используем float() напрямую, без 'or 0'/'or 1', чтобы отловить пустые поля как ошибку
+            try:
+                v0 = float(v['V0'])
+                v1 = float(v['V1'])
+            except ValueError:
+                 raise ValueError("Значения V0 и V1 должны быть числами")
+
             td = parse_time(v['TD'] or "0")
             tr = parse_time(v['TR'] or "1n") # Используем parse_time для всех времен
             tf = parse_time(v['TF'] or "1n")
 
+            if td < 0: raise ValueError("Время задержки (TD) не может быть отрицательным")
+            if tr < 0: raise ValueError("Время нарастания (TR) не может быть отрицательным")
+            if tf < 0: raise ValueError("Время спада (TF) не может быть отрицательным")
+
             if self.mode == "high-low":
-                th = parse_time(v['TH'] or "1u")
-                tl = parse_time(v['TL'] or "1u")
+                th_str = v['TH'] or "1u"
+                tl_str = v['TL'] or "1u"
+                th = parse_time(th_str)
+                tl = parse_time(tl_str)
+                if th < 0: raise ValueError(f"Время High ({th_str}) не может быть отрицательным")
+                if tl < 0: raise ValueError(f"Время Low ({tl_str}) не может быть отрицательным")
             else: # Режим T_PULSE_WIDTH/T_PERIOD
                 pulse_width_str = v['TH'] or "1u"
                 period_str = v['TL'] or "1u"
@@ -573,30 +635,47 @@ class PulseApp(ttk.Frame):
                 period = parse_time(period_str)
 
                 # Проверки для режима PW/Period
+                if pulse_width < 0: raise ValueError(f"Ширина импульса PW ({pulse_width_str}) не может быть отрицательной")
+                if period < 0: raise ValueError(f"Период ({period_str}) не может быть отрицательным")
+
                 min_pw = tr + tf
-                if pulse_width < min_pw:
+                # Добавляем допуск для сравнения с плавающей точкой
+                if pulse_width < min_pw - 1e-15:
                     raise ValueError(f"T_PULSE_WIDTH ({fmt(pulse_width)}) должен быть >= TR+TF ({fmt(min_pw)})")
-                if period < pulse_width:
+                if period < pulse_width - 1e-15:
                      raise ValueError(f"T_PERIOD ({fmt(period)}) должен быть >= T_PULSE_WIDTH ({fmt(pulse_width)})")
 
                 # Рассчитываем TH и TL для внутреннего хранения
-                th = pulse_width - tr - tf
-                tl = period - pulse_width
+                # Учитываем, что pulse_width может быть очень близок к min_pw
+                th = max(0.0, pulse_width - min_pw)
+                tl = max(0.0, period - pulse_width)
 
-            n = int(v['N'] or 1)
+            # N может быть 0
+            n_str = v['N'] or "1"
+            try:
+                n = int(n_str)
+            except ValueError:
+                raise ValueError("Число импульсов (Cnt) должно быть целым числом")
+
             if n < 0: raise ValueError("Число импульсов (Cnt) не может быть отрицательным")
 
+            # Создаем объект Signal. Метод update() будет вызван в __post_init__
             return Signal(V0=v0, V1=v1, TD=td, TR=tr, TF=tf, TH=th, TL=tl, N=n, Name=name)
 
         except ValueError as e:
+            # Добавляем контекст ошибки
             raise ValueError(f"Ошибка в параметрах сигнала: {e}")
         except Exception as e:
+            import traceback
+            print(traceback.format_exc()) # Логируем полный стектрейс для отладки
             raise ValueError(f"Неожиданная ошибка чтения параметров: {e}")
+
 
     def _get_selected_index(self):
         s = self.lb.curselection()
         return int(s[0]) if s else None
 
+    # ... (методы move_in_list, on_lb_button_press, on_lb_motion, move_item_up, move_item_down без изменений) ...
     def move_in_list(self, from_index: int, to_index: int):
         if from_index == to_index: return
         sig = self.signals.pop(from_index)
@@ -637,8 +716,9 @@ class PulseApp(ttk.Frame):
         try:
             s = self._read_signal_data()
         except ValueError as e:
-            messagebox.showerror('Ошибка ввода', str(e))
+            messagebox.showerror('Ошибка ввода', str(e), parent=self.master)
             return
+
         self.signals.append(s)
         self.lb.insert('end', s.Name)
         self.lb.select_clear(0, 'end')
@@ -652,16 +732,14 @@ class PulseApp(ttk.Frame):
     def delete(self):
         i = self._get_selected_index()
         if i is None:
-            messagebox.showwarning("Нет выбора", "Сначала выберите сигнал для удаления.")
+            messagebox.showwarning("Нет выбора", "Сначала выберите сигнал для удаления.", parent=self.master)
             return
+
         if 0 <= i < len(self.signals):
-            confirm = messagebox.askyesno("Подтверждение", f"Удалить сигнал '{self.signals[i].Name}'?")
+            confirm = messagebox.askyesno("Подтверждение", f"Удалить сигнал '{self.signals[i].Name}'?", parent=self.master)
             if confirm:
                 self.lb.delete(i)
-                self.signals.pop(i)
-                 # Сбрасываем флаг, если удалили редактируемый из таблицы сигнал
-                if self.updated_from_table_index == i:
-                    self.updated_from_table_index = None
+                del self.signals[i] # Используем del для удаления по индексу
 
                 if self.lb.size() > 0:
                     new_selection = min(i, self.lb.size() - 1)
@@ -674,45 +752,51 @@ class PulseApp(ttk.Frame):
                     self.update_from_table_btn.config(state='disabled')
                 self.draw() # Перерисовать график
         else:
-             messagebox.showerror("Ошибка", "Не удалось удалить сигнал: неверный индекс.")
+             messagebox.showerror("Ошибка", "Не удалось удалить сигнал: неверный индекс.", parent=self.master)
+
 
     def apply_and_draw(self):
         """Применяет параметры из полей ввода к выбранному сигналу и перерисовывает."""
         i = self._get_selected_index()
-        if i is not None:
-            if 0 <= i < len(self.signals):
-                try:
-                    original_name = self.signals[i].Name
-                    updated_signal_params = self._read_signal_data() # Читаем параметры из полей
-                    if not updated_signal_params.Name:
-                        updated_signal_params.Name = original_name
+        if i is None:
+             messagebox.showwarning("Нет выбора", "Сначала выберите сигнал для применения параметров.", parent=self.master)
+             return
 
-                    # Обновляем объект сигнала, используя новые параметры
-                    # Это автоматически вызовет update() и сбросит pwl_points
-                    self.signals[i] = updated_signal_params
+        if 0 <= i < len(self.signals):
+            try:
+                original_name = self.signals[i].Name
+                updated_signal_params = self._read_signal_data() # Читаем параметры из полей
+                if not updated_signal_params.Name:
+                    updated_signal_params.Name = original_name
 
-                    # Если имя изменилось, обновляем Listbox
-                    if self.lb.get(i) != updated_signal_params.Name:
-                        self.lb.delete(i)
-                        self.lb.insert(i, updated_signal_params.Name)
-                        self.lb.select_set(i)
+                # Обновляем объект сигнала, используя новые параметры
+                # Это автоматически вызовет update() и сбросит pwl_points
+                self.signals[i] = updated_signal_params
 
-                    # Сбрасываем флаг редактирования из таблицы, т.к. применили параметры
-                    self.updated_from_table_index = None
-                    # Обновляем таблицу точек, т.к. параметры изменились
-                    self._populate_points_table(self.signals[i])
+                # Если имя изменилось, обновляем Listbox
+                if self.lb.get(i) != updated_signal_params.Name:
+                    self.lb.delete(i)
+                    self.lb.insert(i, updated_signal_params.Name)
+                    self.lb.select_set(i)
 
-                except ValueError as e:
-                    messagebox.showerror('Ошибка ввода', str(e))
-                    return # Не перерисовываем если ошибка
-                except Exception as e:
-                    messagebox.showerror('Ошибка применения', f"Не удалось применить изменения: {e}")
-                    return # Не перерисовываем если ошибка
+                # Обновляем таблицу точек, т.к. параметры изменились (и pwl_points сбросились)
+                self._populate_points_table(self.signals[i])
+                # Делаем кнопку обновления по таблице активной, так как таблица теперь отражает параметры
+                self.update_from_table_btn.config(state='normal')
+
+            except ValueError as e:
+                messagebox.showerror('Ошибка ввода', str(e), parent=self.master)
+                return # Не перерисовываем если ошибка
+            except Exception as e:
+                import traceback
+                messagebox.showerror('Ошибка применения', f"Не удалось применить изменения: {e}\n\n{traceback.format_exc()}", parent=self.master)
+                return # Не перерисовываем если ошибка
         # Перерисовываем все графики
         self.draw()
 
-    # --- Методы для работы с таблицей точек ---
 
+    # --- Методы для работы с таблицей точек ---
+    # ... (методы _clear_points_table, _populate_points_table, _on_tree_double_click, _on_edit_save, _on_edit_cancel без изменений) ...
     def _clear_points_table(self):
         """Очищает таблицу точек."""
         if self._editing_cell_entry: # Уничтожаем виджет редактирования, если он есть
@@ -725,7 +809,8 @@ class PulseApp(ttk.Frame):
         """Заполняет таблицу точек данными из сигнала."""
         self._clear_points_table()
         # Получаем точки (либо из PWL, либо генерируем из PULSE)
-        times, voltages = signal.get_waveform_points() # Не используем xmax для таблицы
+        # Передаем force_pulse=False, чтобы использовать PWL, если они есть
+        times, voltages = signal.get_waveform_points(force_pulse=False)
 
         if not times:
             self.update_from_table_btn.config(state='disabled')
@@ -755,7 +840,12 @@ class PulseApp(ttk.Frame):
 
         item_id = self.points_table.identify_row(event.y)
         column_id = self.points_table.identify_column(event.x)
-        column_index = int(column_id.replace('#', '')) - 1 # 0 для времени, 1 для напряжения
+        # Проверка column_id, может быть пустым, если клик правее последней колонки
+        if not column_id: return
+        try:
+             column_index = int(column_id.replace('#', '')) - 1 # 0 для времени, 1 для напряжения
+        except ValueError:
+             return # Не смогли определить индекс колонки
 
         if not item_id or column_index < 0 or column_index > 1:
             return # Не попали или не та колонка
@@ -765,6 +855,8 @@ class PulseApp(ttk.Frame):
 
         # Получаем текущее значение
         current_values = self.points_table.item(item_id, 'values')
+        # Проверка, что values не пустые (может случиться при странных обстоятельствах)
+        if not current_values or len(current_values) <= column_index: return
         value = current_values[column_index]
 
         # Создаем Entry поверх ячейки
@@ -795,13 +887,20 @@ class PulseApp(ttk.Frame):
         col_index = info['column_index']
 
         # Получаем текущие значения строки
-        current_values = list(self.points_table.item(item_id, 'values'))
+        try:
+            current_values = list(self.points_table.item(item_id, 'values'))
+        except tk.TclError:
+            # Элемент мог быть удален, пока редактирование было активно
+            entry.destroy()
+            self._editing_cell_entry = None
+            return
 
         # Пытаемся валидировать и обновить значение
         try:
             if col_index == 0: # Время
                 # Пробуем парсить время, допускаем и просто числа (секунды)
                 parsed_time = parse_time(new_value_str)
+                if parsed_time < 0: raise ValueError("Время не может быть отрицательным")
                 formatted_time = fmt(parsed_time) # Переформатируем для единообразия
                 current_values[col_index] = formatted_time
             else: # Напряжение
@@ -816,12 +915,17 @@ class PulseApp(ttk.Frame):
             # Не закрываем редактор при ошибке, даем исправить
             entry.focus_set() # Возвращаем фокус
             return # Прерываем сохранение
+        except Exception as e_update:
+             print(f"Error updating treeview item: {e_update}")
+             # Ошибка обновления элемента (возможно, он был удален)
+             # Просто закроем редактор
 
         # Уничтожаем Entry
         entry.destroy()
         self._editing_cell_entry = None
-        # Возможно, стоит вызвать _update_graph_from_table() сразу?
-        # Или оставить это на кнопку "Обновить график по данным таблицы"
+        # Не обновляем график автоматически, оставляем это на кнопку
+        # Но нужно сигнализировать, что данные в таблице изменились и могут отличаться
+        # от отображаемого графика (если он был по параметрам)
 
     def _on_edit_cancel(self, event):
         """Отменяет редактирование и уничтожает Entry."""
@@ -833,23 +937,30 @@ class PulseApp(ttk.Frame):
         """Читает данные из таблицы, обновляет PWL точки сигнала и перерисовывает график."""
         idx = self._get_selected_index()
         if idx is None or not (0 <= idx < len(self.signals)):
-             messagebox.showwarning("Нет выбора", "Выберите сигнал, для которого нужно обновить график по таблице.")
+             messagebox.showwarning("Нет выбора", "Выберите сигнал, для которого нужно обновить график по таблице.", parent=self.master)
              return
 
         signal = self.signals[idx]
         new_times = []
         new_voltages = []
         row_num = 0
+        last_time = -float('inf') # Для проверки монотонности
 
         # Проходим по всем строкам таблицы
         item_ids = self.points_table.get_children()
         if not item_ids:
-             messagebox.showinfo("Таблица пуста", "Нет точек для обновления.")
+             messagebox.showinfo("Таблица пуста", "Нет точек для обновления.", parent=self.master)
              return
 
         for item_id in item_ids:
             row_num += 1
             values = self.points_table.item(item_id, 'values')
+            # Проверка на случай пустых значений (маловероятно, но возможно)
+            if not values or len(values) < 2:
+                messagebox.showerror("Ошибка данных в таблице", f"Ошибка в строке {row_num}: Неполные данные.", parent=self.master)
+                self.points_table.selection_set(item_id); self.points_table.focus(item_id); self.points_table.see(item_id)
+                return
+
             time_str = values[0]
             voltage_str = values[1]
 
@@ -860,36 +971,55 @@ class PulseApp(ttk.Frame):
                 v = float(voltage_str)
 
                 # Проверка монотонности времени (важно!)
-                if new_times and t <= new_times[-1]:
-                     # Нестрогое неравенство, т.к. две точки могут быть в одно время (вертикальный фронт)
-                     # Но для PWL лучше избегать строго одинакового времени, если только это не последняя точка обновления напряжения
-                    if t < new_times[-1]:
-                         raise ValueError(f"Время должно монотонно возрастать. Нарушение в строке {row_num} ({fmt(t)} <= {fmt(new_times[-1])}).")
-                    # Если время то же самое, обновляем напряжение последней добавленной точки
-                    elif new_voltages:
-                        new_voltages[-1] = v
-                        continue # Не добавляем новую точку, только обновляем напряжение
-
-                new_times.append(t)
-                new_voltages.append(v)
+                if t < last_time - 1e-15: # Допуск для сравнения
+                    raise ValueError(f"Время должно монотонно возрастать. Нарушение в строке {row_num} ({fmt(t)} < {fmt(last_time)}).")
+                # Если время то же самое, обновляем напряжение последней добавленной точки
+                elif abs(t - last_time) < 1e-15 and new_voltages:
+                    new_voltages[-1] = v
+                    continue # Не добавляем новую точку, только обновляем напряжение
+                # Иначе (время больше) - добавляем новую точку
+                else:
+                     new_times.append(t)
+                     new_voltages.append(v)
+                     last_time = t
 
             except ValueError as e:
-                messagebox.showerror("Ошибка данных в таблице", f"Ошибка в строке {row_num}:\n{e}")
+                messagebox.showerror("Ошибка данных в таблице", f"Ошибка в строке {row_num} (значения: '{time_str}', '{voltage_str}'):\n{e}", parent=self.master)
                 # Выделяем ошибочную строку в таблице
                 self.points_table.selection_set(item_id)
                 self.points_table.focus(item_id)
                 self.points_table.see(item_id)
                 return # Прерываем обновление
 
+        # Проверка на минимальное количество точек
+        if len(new_times) < 1: # Достаточно одной точки (t=0, V)
+            messagebox.showerror("Ошибка данных", "Необходимо как минимум 1 точка для определения сигнала.", parent=self.master)
+            return
+        # Если первая точка не t=0, добавим ее с напряжением первой точки
+        if new_times[0] > 1e-15:
+            new_times.insert(0, 0.0)
+            new_voltages.insert(0, new_voltages[0])
+
+
         # Если все успешно прочитано, обновляем PWL данные сигнала
         signal.set_pwl_points(new_times, new_voltages)
 
-        # Устанавливаем флаг, что этот сигнал теперь определяется таблицей
-        self.updated_from_table_index = idx
+        # Обновляем поля V0/V1 в интерфейсе, чтобы отразить начало сигнала из PWL
+        # Остальные поля (TR/TF и т.д.) не трогаем, они больше не релевантны для формы сигнала
+        self.ent['V0'].delete(0, 'end'); self.ent['V0'].insert(0, f"{new_voltages[0]:g}")
+        # Найдем первый отличающийся уровень для V1, или используем V0
+        v1_display = new_voltages[0]
+        for v in new_voltages:
+            if abs(v - v1_display) > 1e-9:
+                v1_display = v
+                break
+        self.ent['V1'].delete(0, 'end'); self.ent['V1'].insert(0, f"{v1_display:g}")
+
 
         # Перерисовываем график
         self.draw()
-        messagebox.showinfo("Обновление", f"График для сигнала '{signal.Name}' обновлен по данным из таблицы.")
+        messagebox.showinfo("Обновление", f"График для сигнала '{signal.Name}' обновлен по данным из таблицы.", parent=self.master)
+
 
     # --- Остальные методы ---
 
@@ -908,29 +1038,47 @@ class PulseApp(ttk.Frame):
             self._clear_entries()
             self._clear_points_table()
             self.update_from_table_btn.config(state='disabled')
+            # Если список пуст, график тоже надо очистить
+            if not self.signals:
+                self.draw()
             return
 
         if 0 <= i < len(self.signals):
             s = self.signals[i]
             self._update_entries(s) # Обновляем поля параметров
             self._populate_points_table(s) # Заполняем таблицу точек
-            # Сбросим флаг редактирования из таблицы при смене сигнала
-            # Пользователь должен явно нажать кнопку "Обновить по таблице" для нового сигнала
-            self.updated_from_table_index = None
+            # Кнопка "Обновить по таблице" всегда активна, если есть точки в таблице
+            self.update_from_table_btn.config(state='normal' if self.points_table.get_children() else 'disabled')
             # Перерисуем график, чтобы снять выделение предыдущего и выделить новый
             self.draw()
 
 
     def _update_entries(self, signal: Signal):
          """Обновляет поля ввода параметров на основе данных сигнала."""
-         # Если сигнал был изменен через таблицу, поля параметров могут не соответствовать
-         # PWL точкам. Показываем параметры как есть.
-         self.ent['V0'].delete(0, 'end'); self.ent['V0'].insert(0, f"{signal.V0:g}")
-         self.ent['V1'].delete(0, 'end'); self.ent['V1'].insert(0, f"{signal.V1:g}")
+         # Если сигнал использует PWL точки, поля V0/V1 берем из них,
+         # остальные параметры - из сохраненных базовых параметров сигнала.
+         if signal.pwl_points and signal.pwl_points[1]:
+             v0_display = signal.pwl_points[1][0]
+             v1_display = v0_display
+             for v in signal.pwl_points[1]:
+                 if abs(v - v0_display) > 1e-9:
+                     v1_display = v
+                     break
+             self.ent['V0'].delete(0, 'end'); self.ent['V0'].insert(0, f"{v0_display:g}")
+             self.ent['V1'].delete(0, 'end'); self.ent['V1'].insert(0, f"{v1_display:g}")
+         else:
+             # Используем V0/V1 из параметров сигнала
+             self.ent['V0'].delete(0, 'end'); self.ent['V0'].insert(0, f"{signal.V0:g}")
+             self.ent['V1'].delete(0, 'end'); self.ent['V1'].insert(0, f"{signal.V1:g}")
+
+         # Остальные поля всегда показывают сохраненные параметры PULSE
          self.ent['TD'].delete(0, 'end'); self.ent['TD'].insert(0, fmt(signal.TD))
          self.ent['TR'].delete(0, 'end'); self.ent['TR'].insert(0, fmt(signal.TR))
          self.ent['TF'].delete(0, 'end'); self.ent['TF'].insert(0, fmt(signal.TF))
+         self.ent['N'].delete(0, 'end'); self.ent['N'].insert(0, signal.N)
+         self.ent['Name'].delete(0, 'end'); self.ent['Name'].insert(0, signal.Name)
 
+         # Поля TH/TL зависят от режима
          if self.mode == "high-low":
              self.ent['TH'].delete(0, 'end'); self.ent['TH'].insert(0, fmt(signal.TH))
              self.ent['TL'].delete(0, 'end'); self.ent['TL'].insert(0, fmt(signal.TL))
@@ -942,13 +1090,12 @@ class PulseApp(ttk.Frame):
              period_str = fmt(period) if period > 1e-15 else "0s"
              self.ent['TL'].delete(0, 'end'); self.ent['TL'].insert(0, period_str)
 
-         self.ent['N'].delete(0, 'end'); self.ent['N'].insert(0, signal.N)
-         self.ent['Name'].delete(0, 'end'); self.ent['Name'].insert(0, signal.Name)
 
     def _clear_entries(self):
         for key in self.ent:
             self.ent[key].delete(0, 'end')
 
+    # ... (метод draw без изменений) ...
     def draw(self):
         """Перерисовывает все графики сигналов."""
         self.fig.clf() # Очищаем фигуру полностью
@@ -995,33 +1142,41 @@ class PulseApp(ttk.Frame):
         n_signals = len(self.signals)
         idx_sel = self._get_selected_index() # Индекс выбранного в Listbox сигнала
 
-        # Определяем общий масштаб и единицы, если X-max задан глобально
-        common_scale, common_unit = (1, 's')
+        # Определяем общий масштаб и единицы
+        # Если X-max задан глобально, используем его
+        # Иначе, находим максимальное время среди всех сигналов
+        max_time_for_scale = 0
         if xmax_sec_global is not None:
-            common_scale, common_unit = autoscale(xmax_sec_global)
+            max_time_for_scale = xmax_sec_global
         else:
-            # Если X-max не задан, найдем максимальное время среди всех сигналов
-            # для определения общего масштаба, чтобы оси X были согласованы
-            max_total_time = 0
             for s in self.signals:
-                 # Учитываем и PWL точки, если они есть
-                signal_time = s.pwl_points[0][-1] if s.pwl_points and s.pwl_points[0] else s.total_time
-                max_total_time = max(max_total_time, signal_time)
-            if max_total_time > 0:
-                common_scale, common_unit = autoscale(max_total_time)
-            else:
-                common_scale, common_unit = (1e9, 'ns') # По умолчанию наносекунды, если все времена 0
+                 # total_time теперь корректно отражает конец PWL или PULSE
+                max_time_for_scale = max(max_time_for_scale, s.total_time)
+
+        # Устанавливаем масштаб по умолчанию, если время нулевое
+        if max_time_for_scale <= 0: max_time_for_scale = 1e-9 # e.g., 1 ns
+
+        common_scale, common_unit = autoscale(max_time_for_scale)
 
         # --- Рисование каждого сигнала ---
-        for i, s in enumerate(self.signals):
-            ax = self.fig.add_subplot(n_signals, 1, i + 1)
+        # Используем gridspec для более гибкого управления subplot'ами
+        gs = self.fig.add_gridspec(n_signals, 1, hspace=0.1) # Уменьшим расстояние между графиками
+        axes = gs.subplots(sharex=True) # Делаем оси X общими
+        if n_signals == 1: axes = [axes] # Убедимся, что axes - это всегда список
+
+        for i, (ax, s) in enumerate(zip(axes, self.signals)):
+             # ax = self.fig.add_subplot(n_signals, 1, i + 1) # Старый способ
 
             # Получаем точки сигнала
             # Используем xmax_sec_global, если он задан, иначе None
-            times_sec, voltages = s.get_waveform_points(xmax=xmax_sec_global)
+            # force_pulse=False, чтобы использовать PWL точки если они есть
+            times_sec, voltages = s.get_waveform_points(xmax=xmax_sec_global, force_pulse=False)
 
             # Определяем реальное максимальное время на графике для этого сигнала
-            actual_xmax_sec = xmax_sec_global if xmax_sec_global is not None else (times_sec[-1] if times_sec else 0)
+            # Если xmax задан, используем его, иначе берем последнюю точку или total_time
+            actual_xmax_sec = xmax_sec_global if xmax_sec_global is not None else (times_sec[-1] if times_sec else s.total_time)
+            # Убедимся, что xmax не отрицательный и не слишком мал
+            if actual_xmax_sec <= 0: actual_xmax_sec = 1e-9
 
             # Используем общий масштаб и единицы для оси X
             current_scale = common_scale
@@ -1031,75 +1186,102 @@ class PulseApp(ttk.Frame):
             times_scaled = [t * current_scale for t in times_sec]
 
             # Рисуем график
+            line_color = 'C0' # Синий по умолчанию
+            line_style = '-'
+            line_width = 1.5
+            # Можно добавить выделение для сигнала, созданного из таблицы/PWL
+            # if s.pwl_points is not None:
+            #     line_color = 'C1' # Оранжевый
+            #     line_style = '--'
+
             if times_scaled:
-                ax.plot(times_scaled, voltages, lw=1.5, color='C0')
+                ax.plot(times_scaled, voltages, lw=line_width, color=line_color, ls=line_style)
             else:
                 # Если точек нет (например, сигнал с нулевой длительностью)
                 # Нарисуем горизонтальную линию на уровне V0
-                ax.plot([0, 1e-9 * current_scale], [s.V0, s.V0], lw=1.5, color='C0') # Рисуем очень короткий отрезок
-                if actual_xmax_sec == 0 : actual_xmax_sec = 1e-9 # Минимальное время для оси
+                v0_plot = s.V0 if s.pwl_points is None else s.pwl_points[1][0] # Учитываем PWL
+                ax.plot([0, actual_xmax_sec * current_scale], [v0_plot, v0_plot], lw=line_width, color=line_color, ls=line_style)
+
 
             # Настройка внешнего вида subplot'а
             title_style = {'fontweight': 'bold', 'color': 'darkblue'} if i == idx_sel else {}
-            ax.set_title(s.Name, fontsize=10, loc='left', **title_style)
+            ax.set_title(s.Name, fontsize=9, loc='left', y=0.85, **title_style) # Сдвинем заголовок чуть ниже
             ax.set_ylabel('V', fontsize=9)
+            ax.tick_params(axis='y', labelsize=8) # Уменьшим шрифт тиков Y
 
             # Настройка пределов по Y
-            v_min_data = min(voltages) if voltages else s.V0
-            v_max_data = max(voltages) if voltages else s.V1
-            # Учитываем V0 и V1 для определения диапазона
-            v_min_eff = min(s.V0, s.V1, v_min_data)
-            v_max_eff = max(s.V0, s.V1, v_max_data)
-            v_range = v_max_eff - v_min_eff
-            if abs(v_range) < 1e-9: v_range = 1.0 # Избегаем нулевого диапазона
-            ax.set_ylim(v_min_eff - v_range * 0.15, v_max_eff + v_range * 0.15)
+            v_min_data = min(voltages) if voltages else -1.0 # Дефолт, если нет точек
+            v_max_data = max(voltages) if voltages else 1.0
 
-            # Настройка пределов по X
+            # Используем V0/V1 из PWL, если они есть, для определения диапазона
+            v0_eff = s.pwl_points[1][0] if s.pwl_points and s.pwl_points[1] else s.V0
+            v1_eff = v0_eff
+            if s.pwl_points and s.pwl_points[1]:
+                 for v in s.pwl_points[1]:
+                     if abs(v - v0_eff) > 1e-9: v1_eff = v; break
+            else:
+                 v1_eff = s.V1
+
+            v_min_eff = min(v0_eff, v1_eff, v_min_data)
+            v_max_eff = max(v0_eff, v1_eff, v_max_data)
+
+            v_range = v_max_eff - v_min_eff
+            if abs(v_range) < 1e-9: v_range = max(1.0, abs(v_max_eff)*0.2) # Избегаем нулевого диапазона
+            margin = v_range * 0.15
+            ax.set_ylim(v_min_eff - margin, v_max_eff + margin)
+
+            # Настройка пределов по X (будет общей из-за sharex)
             xmax_limit_scaled = actual_xmax_sec * current_scale
             # Добавим небольшой отступ справа, если xmax не был задан явно
-            xmax_display = xmax_limit_scaled * 1.02 if xmax_sec_global is None and xmax_limit_scaled > 0 else xmax_limit_scaled
-            if xmax_display <= 0: xmax_display = 1 # Минимальный предел, если время 0
+            xmax_display = xmax_limit_scaled * 1.03 if xmax_sec_global is None else xmax_limit_scaled
+            # Убедимся что xmax_display > 0
+            if xmax_display <= 0 : xmax_display = 1.0 # Минимальный предел = 1 (в текущем масштабе)
 
             ax.set_xlim(0, xmax_display)
 
-            # Настройка тиков оси X
-            if tick_step_sec is not None: # Задан пользователем
-                base_step_scaled = tick_step_sec * current_scale
-                if base_step_scaled > 1e-12: # Проверяем, что шаг не слишком мал для масштаба
-                    locator = ticker.MultipleLocator(base=base_step_scaled)
-                else:
-                    print(f"Warning: Шаг тиков X ({fmt(tick_step_sec)}) слишком мал для масштаба '{current_unit}'. Используется auto.")
-                    locator = ticker.MaxNLocator(nbins='auto', prune='both', integer=False)
-            else: # Автоматический подбор
-                locator = ticker.MaxNLocator(nbins='auto', prune='both', integer=False)
+            # Настройка тиков оси X (делаем только для нижнего графика)
+            if i == n_signals - 1:
+                if tick_step_sec is not None: # Задан пользователем
+                    base_step_scaled = tick_step_sec * current_scale
+                    if base_step_scaled > 1e-12: # Проверяем, что шаг не слишком мал для масштаба
+                        locator = ticker.MultipleLocator(base=base_step_scaled)
+                    else:
+                        print(f"Warning: Шаг тиков X ({fmt(tick_step_sec)}) слишком мал для масштаба '{current_unit}'. Используется auto.")
+                        locator = ticker.MaxNLocator(nbins='auto', prune='both', integer=False, min_n_ticks=3)
+                else: # Автоматический подбор
+                    locator = ticker.MaxNLocator(nbins='auto', prune='both', integer=False, min_n_ticks=3)
 
-            ax.xaxis.set_major_locator(locator)
-            ax.xaxis.set_major_formatter(unit_formatter(current_unit)) # Используем общий unit
-
-            # Сетка и метка оси X (только для нижнего графика)
-            ax.grid(True, ls=':', lw=0.6, color='lightgrey')
-            if i != n_signals - 1:
-                ax.set_xticklabels([]) # Скрываем метки для верхних графиков
-            else:
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(unit_formatter(current_unit)) # Используем общий unit
                 ax.set_xlabel(f'Время ({current_unit})', fontsize=9)
+                ax.tick_params(axis='x', labelsize=8) # Уменьшим шрифт тиков X
+            else:
+                 # Скрываем тики и метки для верхних графиков (не нужно из-за sharex)
+                 # ax.set_xticklabels([]) # Уже делается через sharex
+                 pass
+
+
+            # Сетка
+            ax.grid(True, ls=':', lw=0.6, color='lightgrey')
+
 
         # --- Финальная настройка и отрисовка ---
+        # fig.align_ylabels(axes) # Выравниваем метки Y (если matplotlib >= 3.1)
         try:
-             # Используем constrained_layout для лучшего распределения места
-            self.fig.set_layout_engine('constrained')#, h_pad=0.04, w_pad=0.02)
+            # self.fig.tight_layout(h_pad=0.1) # Tight layout может быть лучше с sharex
+            # Используем constrained_layout для лучшего распределения места
+             self.fig.set_layout_engine('constrained')
         except Exception as e_layout:
-            print(f"Constrained layout failed: {e_layout}. Falling back to tight_layout.")
-            try:
-                 # Запасной вариант - tight_layout
-                 self.fig.tight_layout(h_pad=0.6)
-            except Exception as e_tight:
-                 print(f"Tight layout also failed: {e_tight}. Layout may be suboptimal.")
+             print(f"Layout engine failed: {e_layout}. Layout may be suboptimal.")
+             try: self.fig.tight_layout(h_pad=0.1) # Запасной вариант
+             except: pass
 
         self.canvas.draw_idle() # Запрос на перерисовку в основном цикле Tk
         self.toolbar.update() # Обновляем панель инструментов Matplotlib
 
-    # Методы загрузки/экспорта (оставлены без изменений, но могут потребовать адаптации,
-    # если нужно сохранять/загружать PWL представление)
+
+    # --- Методы загрузки/экспорта ---
+    # ... (метод _choose_export_format без изменений) ...
     def _choose_export_format(self) -> tuple[str | None, bool | None]:
         """
         Создает диалоговое окно для выбора формата экспорта и источника данных.
@@ -1111,7 +1293,10 @@ class PulseApp(ttk.Frame):
         dialog.transient(self.master)
         dialog.grab_set()
         dialog.resizable(False, False)
-        dialog.geometry("+{}+{}".format(self.master.winfo_rootx()+50, self.master.winfo_rooty()+50)) # Центрируем относительно гл. окна
+        # Центрирование относительно главного окна
+        x = self.master.winfo_rootx() + (self.master.winfo_width() // 2) - 150 # Примерная ширина окна / 2
+        y = self.master.winfo_rooty() + (self.master.winfo_height() // 2) - 100 # Примерная высота окна / 2
+        dialog.geometry(f"300x200+{x}+{y}")
 
         formats = ["PULSE", "PWL", "CSV"]
         if XLSX_SUPPORT:
@@ -1121,12 +1306,12 @@ class PulseApp(ttk.Frame):
         format_frame = ttk.Frame(dialog, padding=5)
         format_frame.pack(fill='x', padx=10, pady=(10, 5))
         ttk.Label(format_frame, text="Формат экспорта:").pack(side='left')
-        listbox = tk.Listbox(format_frame, height=len(formats), exportselection=False,
-                            font=('Segoe UI', 10))
-        listbox.pack(side='right', fill='x', expand=True, padx=(5, 0))
-        for fmt in formats:
-            listbox.insert('end', fmt)
-        listbox.selection_set(0) # Выбираем первый по умолчанию
+        format_var = tk.StringVar(value=formats[0]) # Выбираем первый по умолчанию
+        format_combo = ttk.Combobox(format_frame, textvariable=format_var, values=formats, state='readonly', width=15)
+        format_combo.pack(side='right', padx=(5, 0))
+        # Устанавливаем фокус на комбобокс
+        format_combo.focus_set()
+
 
         # --- Выбор источника данных ---
         source_frame = ttk.Frame(dialog, padding=5)
@@ -1138,18 +1323,16 @@ class PulseApp(ttk.Frame):
         source_check.pack(anchor='w')
 
         # --- Кнопки OK/Отмена ---
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(padx=10, pady=(5, 10), fill='x')
+        btn_frame = ttk.Frame(dialog, padding=(0, 10))
+        btn_frame.pack(fill='x', side='bottom') # Помещаем кнопки вниз
 
         selected_format = None
         export_from_table = None
 
         def on_ok():
             nonlocal selected_format, export_from_table
-            selection = listbox.curselection()
-            if selection:
-                selected_format = formats[selection[0]]
-                export_from_table = self.export_use_table_var.get()
+            selected_format = format_var.get()
+            export_from_table = self.export_use_table_var.get()
             dialog.destroy()
 
         def on_cancel():
@@ -1158,24 +1341,27 @@ class PulseApp(ttk.Frame):
             export_from_table = None
             dialog.destroy()
 
-        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok, width=10)
-        ok_btn.pack(side='left', expand=True, padx=5)
-        cancel_btn = ttk.Button(btn_frame, text="Отмена", command=on_cancel, width=10)
-        cancel_btn.pack(side='left', expand=True, padx=5)
+        # Размещаем кнопки по центру
+        center_frame = ttk.Frame(btn_frame)
+        center_frame.pack()
+
+        ok_btn = ttk.Button(center_frame, text="OK", command=on_ok, width=10)
+        ok_btn.pack(side='left', padx=5)
+        cancel_btn = ttk.Button(center_frame, text="Отмена", command=on_cancel, width=10)
+        cancel_btn.pack(side='left', padx=5)
 
         # Биндинги для Enter/Escape
         dialog.bind('<Return>', lambda e: ok_btn.invoke()) # Имитируем нажатие OK
         dialog.bind('<Escape>', lambda e: cancel_btn.invoke()) # Имитируем нажатие Отмена
 
-        listbox.focus_set() # Фокус на список форматов для удобства
-
         dialog.wait_window()
         return selected_format, export_from_table
 
+    # ... (метод export без изменений) ...
     def export(self):
         """Экспортирует данные сигналов в выбранный файл."""
         if not self.signals:
-            messagebox.showinfo('Экспорт', 'Нет сигналов для экспорта.')
+            messagebox.showinfo('Экспорт', 'Нет сигналов для экспорта.', parent=self.master)
             return
 
         format_choice, use_table_data = self._choose_export_format()
@@ -1185,14 +1371,17 @@ class PulseApp(ttk.Frame):
         # --- Особая логика для PULSE формата ---
         # PULSE формат всегда основан на параметрах, игнорируем выбор источника
         force_pulse_export = False
+        data_source_msg = "" # Сообщение для пользователя об источнике данных
+
         if format_choice == "PULSE":
             if use_table_data:
-                 print("Info: Экспорт в PULSE всегда использует параметры сигнала, выбор 'По точкам из таблицы' игнорируется для этого формата.")
+                 # Предупреждаем, что выбор игнорируется
+                 messagebox.showwarning("Экспорт PULSE", "Экспорт в PULSE всегда использует параметры сигнала.\nВыбор 'По точкам из таблицы' будет проигнорирован.", parent=self.master)
             force_pulse_export = True # Принудительно используем параметры для PULSE
-            use_table_data_effective = False # Для отладки или логов
+            data_source_msg = "Параметры (PULSE формат)"
         else:
             force_pulse_export = not use_table_data # Если НЕ из таблицы, то принудительно по параметрам
-            use_table_data_effective = use_table_data
+            data_source_msg = "Таблица" if use_table_data else "Параметры"
 
         # Получаем X-max для экспорта (если задан)
         xmax_str = self.xmax_var.get().strip().lower()
@@ -1203,16 +1392,27 @@ class PulseApp(ttk.Frame):
                 if xmax_sec <= 0: xmax_sec = None
             except ValueError: xmax_sec = None
 
-        # Определяем расширение файла
-        if format_choice == "CSV": def_ext, types = ".csv", [("CSV files", "*.csv"), ("All files", "*.*")]
-        elif format_choice == "XLSX": def_ext, types = ".xlsx", [("Excel files", "*.xlsx"), ("All files", "*.*")]
-        else: def_ext, types = ".txt", [("Text files", "*.txt"), ("All files", "*.*")]
+        # Определяем расширение файла и типы файлов
+        file_types = [("All files", "*.*")]
+        default_name_part = 'params' if force_pulse_export else 'table'
+        if format_choice == "CSV":
+            def_ext = ".csv"
+            types = [("CSV files", "*.csv")]
+        elif format_choice == "XLSX":
+            def_ext = ".xlsx"
+            types = [("Excel files", "*.xlsx")]
+        else: # PULSE, PWL
+            def_ext = ".txt"
+            types = [("Text files", "*.txt"), ("PULSE files", "*.pulse"), ("PWL files", "*.pwl")]
+
+        file_types.insert(0, types[0]) # Помещаем специфичный тип первым
 
         filepath = filedialog.asksaveasfilename(
             defaultextension=def_ext,
-            filetypes=types,
-            initialfile=f"signals_{'params' if force_pulse_export else 'table'}{def_ext}", # Предлагаем имя файла в зависимости от источника
-            title=f"Сохранить как {format_choice} файл (источник: {'Параметры' if force_pulse_export else 'Таблица'})"
+            filetypes=file_types,
+            initialfile=f"signals_{format_choice.lower()}_{default_name_part}{def_ext}", # Предлагаем имя файла
+            title=f"Сохранить как {format_choice} файл (Источник: {data_source_msg})",
+            parent=self.master
         )
         if not filepath: return
 
@@ -1220,219 +1420,229 @@ class PulseApp(ttk.Frame):
             if format_choice == "PWL":
                 with open(filepath, 'w', encoding='utf-8') as f:
                     for s in self.signals:
-                        # Получаем точки с учетом выбора источника
+                        # Получаем точки с учетом выбора источника и xmax
                         times, voltages = s.get_waveform_points(xmax_sec, force_pulse=force_pulse_export)
-                        points_str = " ".join(f"{t:.12g} {v:g}" for t, v in zip(times, voltages))
+                        # Используем научную нотацию для времени для большей точности
+                        # Используем 'g' для напряжения
+                        points_str = " ".join(f"{t:.17g} {v:g}" for t, v in zip(times, voltages))
                         f.write(f"{s.Name}:PWL({points_str})\n")
-                messagebox.showinfo('Экспорт завершен', f'Сигналы сохранены в PWL файл:\n{filepath}\n(Источник: {"Параметры" if force_pulse_export else "Таблица"})')
+                messagebox.showinfo('Экспорт завершен', f'Сигналы сохранены в PWL файл:\n{filepath}\n(Источник: {data_source_msg})', parent=self.master)
 
             elif format_choice == "PULSE":
                 # Здесь всегда используем параметры (force_pulse_export = True)
                 with open(filepath, 'w', encoding='utf-8') as f:
                     for s in self.signals:
-                         # Используем внутренние параметры TR, TH, TF, TL, TP
+                         # Используем внутренние параметры TR, TH, TF, TL, TD, N, V0, V1
+                         # ВАЖНО: Формат PULSE ожидает TH и TP (период), а не TH и TL
                          tp_val = s.TR + s.TH + s.TF + s.TL
-                         f.write(f"{s.Name}:PULSE({s.V0:g} {s.V1:g} {s.TD:.12g} {s.TR:.12g} {s.TF:.12g} {s.TH:.12g} {tp_val:.12g} {s.N})\n")
-                messagebox.showinfo('Экспорт завершен', f'Сигналы сохранены в PULSE файл (всегда по параметрам):\n{filepath}')
+                         # Используем 'g' для напряжений и N, научную нотацию для времен
+                         f.write(f"{s.Name}:PULSE({s.V0:g} {s.V1:g} {s.TD:.17g} {s.TR:.17g} {s.TF:.17g} {s.TH:.17g} {tp_val:.17g} {s.N})\n")
+                messagebox.showinfo('Экспорт завершен', f'Сигналы сохранены в PULSE файл:\n{filepath}\n(Источник: {data_source_msg})', parent=self.master)
 
             elif format_choice in ["CSV", "XLSX"]:
                 # 1. Собрать все уникальные временные точки всех сигналов
                 all_times = set()
                 signals_points_map = {}
                 for s in self.signals:
-                    # Получаем точки с учетом выбора источника
+                    # Получаем точки с учетом выбора источника и xmax
                     times, voltages = s.get_waveform_points(xmax_sec, force_pulse=force_pulse_export)
-                    all_times.update(times)
+                    # Используем небольшой допуск при добавлении времен в set
+                    # чтобы избежать дубликатов из-за ошибок округления
+                    for t in times:
+                        # Можно округлить до разумного числа знаков (e.g., 15-17)
+                        # all_times.add(round(t, 17))
+                        # Или просто использовать как есть, set разберется
+                         all_times.add(t)
+
                     signals_points_map[s.Name] = (times, voltages)
 
                 sorted_times = sorted(list(all_times))
+                # Убедимся, что 0.0 есть в списке, если его там нет
+                if 0.0 not in all_times and (not sorted_times or sorted_times[0] > 1e-18):
+                    sorted_times.insert(0, 0.0)
 
-                # 2. Создать строки данных (логика без изменений)
+
+                # 2. Создать строки данных
                 headers = ['Time (s)'] + [s.Name for s in self.signals]
                 data_rows = [headers]
-                for t in sorted_times:
-                    row = [t]
+                # Создаем lookup для быстрого поиска индекса времени
+                time_index_map = {t: i for i, t in enumerate(sorted_times)}
+
+                # Готовим интерполированные данные для каждого сигнала
+                signal_interp_voltages = {}
+                for s in self.signals:
+                    s_times, s_voltages = signals_points_map[s.Name]
+                    # Используем numpy для быстрой интерполяции (step-функция)
+                    # 'previous' означает, что значение сохраняется до следующей точки
+                    interp_func = np.interp
+                    # Создаем numpy массивы
+                    np_s_times = np.array(s_times)
+                    np_s_voltages = np.array(s_voltages)
+                    np_sorted_times = np.array(sorted_times)
+
+                    # Интерполируем значения для всех времен в sorted_times
+                    # np.interp делает линейную интерполяцию. Нам нужна ступенчатая.
+                    # Найдем индексы в s_times для каждого времени в sorted_times
+                    # searchsorted возвращает индекс i, такой что s_times[i-1] <= t < s_times[i]
+                    indices = np.searchsorted(np_s_times, np_sorted_times, side='right')
+                    # Берем значение из предыдущей точки s_times
+                    indices = np.maximum(0, indices - 1) # Убедимся, что индекс не отрицательный
+                    interp_voltages = np_s_voltages[indices]
+
+                    # Особый случай для времени t=0, если оно не было в исходных данных сигнала
+                    if 0.0 not in np_s_times and 0.0 in time_index_map:
+                         start_v = s.V0 if s.pwl_points is None else s.pwl_points[1][0]
+                         interp_voltages[time_index_map[0.0]] = start_v
+
+
+                    signal_interp_voltages[s.Name] = interp_voltages
+
+                # Собираем строки
+                for i, t in enumerate(sorted_times):
+                    row = [f"{t:.17g}"] # Время с высокой точностью
                     for s in self.signals:
-                        signal_times, signal_voltages = signals_points_map[s.Name]
-                        voltage_at_t = s.V0
-                        found = False
-                        for i in range(len(signal_times)):
-                            # Используем небольшой допуск при сравнении времени <= t
-                            if signal_times[i] <= t + 1e-15:
-                                voltage_at_t = signal_voltages[i]
-                                found = True
-                            else:
-                                break
-                        if not found and signal_times and t < signal_times[0]:
-                             voltage_at_t = s.V0
-                        row.append(voltage_at_t)
+                        v = signal_interp_voltages[s.Name][i]
+                        row.append(f"{v:g}") # Напряжение компактно
                     data_rows.append(row)
 
-                # 3. Записать в файл (логика без изменений)
+
+                # 3. Записать в файл
                 if format_choice == "CSV":
                     with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f, delimiter=',')
+                        writer = csv.writer(f, delimiter=',') # Стандартный разделитель для CSV
                         writer.writerows(data_rows)
-                    messagebox.showinfo('Экспорт завершен', f'Временные диаграммы сохранены в CSV файл:\n{filepath}\n(Источник: {"Параметры" if force_pulse_export else "Таблица"})')
+                    messagebox.showinfo('Экспорт завершен', f'Временные диаграммы сохранены в CSV файл:\n{filepath}\n(Источник: {data_source_msg})', parent=self.master)
                 else: # XLSX
+                    if not XLSX_SUPPORT: # Доп. проверка, хотя диалог не должен был это позволить
+                         raise ImportError("Библиотека openpyxl не найдена, не могу сохранить XLSX.")
                     wb = Workbook()
                     ws = wb.active
                     ws.title = "Signals"
                     for r_idx, row_data in enumerate(data_rows, 1):
-                        ws.append(row_data)
+                        # Преобразуем строки с числами в числа для Excel
+                        converted_row = []
+                        for cell_idx, cell_value in enumerate(row_data):
+                            if r_idx > 1: # Не трогаем заголовки
+                                try:
+                                    # Первую колонку (время) и остальные (напряжение) пробуем как float
+                                    converted_row.append(float(cell_value))
+                                except ValueError:
+                                    converted_row.append(cell_value) # Оставляем как есть, если не число
+                            else:
+                                converted_row.append(cell_value)
+                        ws.append(converted_row)
+
+                        # Делаем заголовки жирными
                         if r_idx == 1:
                             for col in range(1, len(headers) + 1):
                                 ws.cell(row=1, column=col).font = Font(bold=True)
+                    # Автоподбор ширины колонок
                     for col in ws.columns:
                         max_length = 0
                         column_letter = get_column_letter(col[0].column)
                         for cell in col:
                             try:
-                                if len(str(cell.value)) > max_length:
-                                    max_length = len(str(cell.value))
+                                if cell.value is not None:
+                                    # Форматируем числа для корректного измерения длины
+                                    if isinstance(cell.value, (int, float)):
+                                        cell_str = f"{cell.value:g}" # Используем 'g' для компактности
+                                    else:
+                                        cell_str = str(cell.value)
+
+                                    if len(cell_str) > max_length:
+                                        max_length = len(cell_str)
                             except: pass
+                        # Устанавливаем ширину с небольшим запасом
                         adjusted_width = (max_length + 2) * 1.1
                         ws.column_dimensions[column_letter].width = adjusted_width
-                    wb.save(filepath)
-                    messagebox.showinfo('Экспорт завершен', f'Временные диаграммы сохранены в Excel файл:\n{filepath}\n(Источник: {"Параметры" if force_pulse_export else "Таблица"})')
 
+                    wb.save(filepath)
+                    messagebox.showinfo('Экспорт завершен', f'Временные диаграммы сохранены в Excel файл:\n{filepath}\n(Источник: {data_source_msg})', parent=self.master)
+
+        except ImportError as e:
+             messagebox.showerror("Ошибка экспорта", f"Не удалось экспортировать в XLSX:\n{e}\nУстановите библиотеку 'openpyxl'.", parent=self.master)
         except Exception as e:
             import traceback
-            messagebox.showerror("Ошибка экспорта", f"Не удалось сохранить файл:\n{e}\n\n{traceback.format_exc()}")
+            messagebox.showerror("Ошибка экспорта", f"Не удалось сохранить файл:\n{e}\n\n{traceback.format_exc()}", parent=self.master)
 
 
     def load(self):
-        """Загружает сигналы из выбранного файла."""
+        """Загружает сигналы из выбранного файла (PULSE/PWL txt, CSV, XLSX)."""
+        file_types = [
+            ("Поддерживаемые файлы", "*.txt *.pulse *.pwl *.csv *.xlsx"),
+            ("Text files (PULSE/PWL)", "*.txt *.pulse *.pwl"),
+            ("CSV files", "*.csv"),
+        ]
+        if XLSX_SUPPORT:
+            file_types.append(("Excel files", "*.xlsx"))
+        file_types.append(("All files", "*.*"))
+
         filepath = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-            title="Загрузить сигналы из файла"
+            filetypes=file_types,
+            title="Загрузить сигналы из файла",
+            parent=self.master
         )
         if not filepath: return
 
+        loaded_signals = []
+        parse_errors = []
+        file_type = None
+        file_ext = os.path.splitext(filepath)[1].lower()
+
+        # Определяем тип файла
+        if file_ext in ['.txt', '.pulse', '.pwl']:
+            file_type = 'text'
+        elif file_ext == '.csv':
+            file_type = 'csv'
+        elif file_ext == '.xlsx':
+            if not XLSX_SUPPORT:
+                messagebox.showerror("Ошибка загрузки", "Библиотека 'openpyxl' не найдена. Невозможно загрузить XLSX файлы.\nУстановите ее: pip install openpyxl", parent=self.master)
+                return
+            file_type = 'xlsx'
+        else:
+            # Попробуем определить как текстовый, если расширение неизвестно
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    f.read(10) # Пробуем прочитать немного
+                file_type = 'text' # Похоже на текст
+                print(f"Warning: Неизвестное расширение '{file_ext}', пытаемся обработать как текстовый файл.")
+            except Exception:
+                 messagebox.showerror("Ошибка загрузки", f"Неподдерживаемый тип файла или ошибка чтения: {os.path.basename(filepath)}", parent=self.master)
+                 return
+
+        # --- Загрузка в зависимости от типа ---
         try:
-            with open(filepath, 'r', encoding='utf-8') as f: lines = f.readlines()
-        except IOError as e:
-            messagebox.showerror("Ошибка чтения", f"Не удалось открыть файл:\n{e}")
+            if file_type == 'text':
+                loaded_signals, parse_errors = self._load_text(filepath)
+            elif file_type == 'csv':
+                loaded_signals, parse_errors = self._load_csv(filepath)
+            elif file_type == 'xlsx':
+                loaded_signals, parse_errors = self._load_xlsx(filepath)
+
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Критическая ошибка загрузки", f"Произошла неожиданная ошибка при загрузке файла:\n{e}\n\n{traceback.format_exc()}", parent=self.master)
             return
 
-        loaded_signals = [] # Собираем сюда, чтобы не портить self.signals при ошибке
-        parse_errors = []
-
-        for lineno, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line or line.startswith('#'): continue # Пропускаем пустые и комментарии
-
-            try:
-                if ':' not in line: raise ValueError("Отсутствует разделитель ':'")
-                name_part, data_part = line.split(':', 1)
-                name = name_part.strip()
-                data_part = data_part.strip().upper() # Приводим к верхнему регистру для PULSE/PWL
-
-                if data_part.startswith("PULSE(") and data_part.endswith(")"):
-                    inner = data_part[len("PULSE("):-1].strip()
-                    tokens = inner.split()
-                    if len(tokens) != 8: raise ValueError(f"PULSE: Ожидалось 8 значений, получено {len(tokens)}")
-                    # Парсим значения PULSE (V0 V1 TD TR TF TH TP N)
-                    v0 = float(tokens[0])
-                    v1 = float(tokens[1])
-                    # Время парсим через parse_time, чтобы поддержать единицы
-                    td = parse_time(tokens[2])
-                    tr = parse_time(tokens[3])
-                    tf = parse_time(tokens[4])
-                    th = parse_time(tokens[5])
-                    tp = parse_time(tokens[6]) # Это T_PERIOD или T_PULSE? В старом формате это TP = TR+TH+TF+TL
-                    n = int(tokens[7])
-                    if n < 0: raise ValueError("PULSE: Число импульсов (N) не может быть отрицательным")
-
-                    # Рассчитываем TL из TP
-                    # TP = TR + TH + TF + TL
-                    tl = tp - (tr + th + tf)
-                    # Проверка на корректность времен
-                    if tr < 0 or tf < 0 or th < 0 or td < 0: raise ValueError("PULSE: Времена не могут быть отрицательными")
-                    if tl < -1e-12: # Допускаем небольшую погрешность вычислений
-                       # Если TL отрицательный, возможно, TH был задан как PW?
-                       # Попробуем интерпретировать 6-е значение (TH) как PW (Pulse Width)
-                       pw_candidate = th
-                       if pw_candidate >= tr + tf:
-                           th_recalculated = pw_candidate - tr - tf
-                           tl_recalculated = tp - pw_candidate # period - pulse_width
-                           if tl_recalculated >= -1e-12:
-                               print(f"Warning line {lineno}: Negative TL calculated. Assuming 6th parameter was PW, not TH. Recalculated TH={fmt(th_recalculated)}, TL={fmt(tl_recalculated)}")
-                               th = th_recalculated
-                               tl = max(0, tl_recalculated) # Убедимся, что не отрицательное из-за погрешности
-                           else:
-                               raise ValueError(f"PULSE: Вычисленное значение TL ({fmt(tl)}) отрицательно, и интерпретация 6-го параметра как PW тоже не подходит.")
-                       else:
-                           raise ValueError(f"PULSE: Вычисленное значение TL ({fmt(tl)}) отрицательно.")
-                    else:
-                        tl = max(0, tl) # Убедимся, что не отрицательное из-за погрешности
-
-                    sig = Signal(V0=v0, V1=v1, TD=td, TR=tr, TF=tf, TH=th, TL=tl, N=n, Name=name)
-                    loaded_signals.append(sig)
-
-                elif data_part.startswith("PWL(") and data_part.endswith(")"):
-                    inner = data_part[len("PWL("):-1].strip()
-                    tokens = inner.split()
-                    if not tokens: raise ValueError("PWL: Нет точек данных")
-                    if len(tokens) % 2 != 0: raise ValueError("PWL: Нечетное число значений (ожидаются пары время-напряжение)")
-
-                    pwl_times = []
-                    pwl_voltages = []
-                    last_t = -1.0
-                    for i in range(0, len(tokens), 2):
-                        t_str, v_str = tokens[i], tokens[i+1]
-                        try:
-                             t_val = parse_time(t_str) # Время с единицами
-                             v_val = float(v_str)     # Напряжение просто число
-                        except ValueError as e_pair:
-                             raise ValueError(f"PWL: Ошибка в паре '{t_str} {v_str}': {e_pair}")
-
-                        if t_val < last_t: raise ValueError(f"PWL: Время должно монотонно возрастать (нарушение: {fmt(t_val)} < {fmt(last_t)})")
-                        # Допускаем одинаковое время для вертикальных фронтов
-                        if t_val == last_t and pwl_times:
-                            pwl_voltages[-1] = v_val # Обновляем напряжение последней точки
-                        else:
-                            pwl_times.append(t_val)
-                            pwl_voltages.append(v_val)
-                        last_t = t_val
-
-                    if len(pwl_times) < 2: raise ValueError("PWL: Необходимо минимум 2 точки (начальная и конечная)")
-
-                    # Создаем "пустой" сигнал PULSE, т.к. не можем надежно восстановить параметры
-                    # V0 и V1 возьмем из первых двух уровней напряжения
-                    v0_pwl = pwl_voltages[0]
-                    v1_pwl = pwl_voltages[1] if len(pwl_voltages) > 1 else v0_pwl # Если только одна точка V1=V0
-                    # Найдем первый не совпадающий с v0_pwl уровень, если возможно
-                    for v in pwl_voltages:
-                        if abs(v - v0_pwl) > 1e-9:
-                             v1_pwl = v
-                             break
-                    # Создаем базовый сигнал (параметры будут игнорироваться при отрисовке, т.к. есть pwl_points)
-                    sig = Signal(V0=v0_pwl, V1=v1_pwl, TD=0, TR=1e-9, TF=1e-9, TH=1e-9, TL=1e-9, N=0, Name=name)
-                    # Сразу устанавливаем PWL точки
-                    sig.set_pwl_points(pwl_times, pwl_voltages)
-                    loaded_signals.append(sig)
-
-                else:
-                    raise ValueError("Неизвестный формат: строка должна начинаться с 'PULSE(' или 'PWL('")
-
-            except Exception as ex:
-                parse_errors.append(f"Строка {lineno}: {line}\n  Ошибка: {ex}")
-
-        # Если были ошибки, сообщаем о них
+        # --- Обработка результатов ---
         if parse_errors:
             error_details = "\n\n".join(parse_errors)
-            messagebox.showerror("Ошибки загрузки", f"Обнаружены ошибки при разборе файла:\n\n{error_details}")
-            # Решаем, загружать ли то, что удалось разобрать
-            if not loaded_signals or not messagebox.askyesno("Продолжить?", "Несмотря на ошибки, загрузить успешно разобранные сигналы?"):
+            # Укоротим сообщение, если оно слишком длинное
+            if len(error_details) > 1000: error_details = error_details[:1000] + "\n..."
+            messagebox.showerror("Ошибки загрузки", f"Обнаружены ошибки при разборе файла '{os.path.basename(filepath)}':\n\n{error_details}", parent=self.master)
+            if not loaded_signals or not messagebox.askyesno("Продолжить?", "Несмотря на ошибки, загрузить успешно разобранные сигналы?", parent=self.master):
                 return # Не загружаем ничего
 
-        # Если ошибок не было или пользователь согласился продолжить
+        if not loaded_signals and not parse_errors:
+             messagebox.showinfo("Файл пуст", f"Файл '{os.path.basename(filepath)}' не содержит данных сигналов или они не были распознаны.", parent=self.master)
+             return
+
+        # --- Обновление интерфейса ---
         self.signals = loaded_signals
         self.lb.delete(0, 'end')
         self._clear_points_table()
         self.update_from_table_btn.config(state='disabled')
-        self.updated_from_table_index = None
+        # self.updated_from_table_index = None # Больше не используется
 
         for s in self.signals:
             self.lb.insert('end', s.Name)
@@ -1442,9 +1652,296 @@ class PulseApp(ttk.Frame):
             self.on_select() # Обновляем поля и таблицу для первого сигнала
         else:
             self._clear_entries()
+            self.draw() # Очистим график, если ничего не загружено
 
-        self.draw() # Рисуем загруженные сигналы
-        messagebox.showinfo("Загрузка завершена", f"Загружено {len(self.signals)} сигнал(ов).")
+        # Рисуем загруженные сигналы (on_select вызовет draw)
+        messagebox.showinfo("Загрузка завершена", f"Загружено {len(self.signals)} сигнал(ов) из файла:\n{os.path.basename(filepath)}.", parent=self.master)
+
+    def _load_text(self, filepath) -> tuple[list[Signal], list[str]]:
+        """Загружает сигналы из текстового файла (PULSE/PWL)."""
+        signals = []
+        errors = []
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f: lines = f.readlines()
+        except IOError as e:
+            errors.append(f"Не удалось открыть файл: {e}")
+            return signals, errors
+
+        for lineno, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'): continue # Пропускаем пустые и комментарии
+
+            try:
+                if ':' not in line: raise ValueError("Отсутствует разделитель ':'")
+                name_part, data_part = line.split(':', 1)
+                name = name_part.strip()
+                if not name: name = f"Signal_{lineno}" # Имя по умолчанию, если пустое
+
+                data_part_upper = data_part.strip().upper() # Приводим к верхнему регистру для PULSE/PWL
+                data_part_orig = data_part.strip() # Сохраняем оригинал для PWL парсинга
+
+                if data_part_upper.startswith("PULSE(") and data_part_upper.endswith(")"):
+                    inner = data_part_orig[len("PULSE("):-1].strip()
+                    tokens = inner.split()
+                    if len(tokens) != 8: raise ValueError(f"PULSE: Ожидалось 8 значений (V0 V1 TD TR TF TH TP N), получено {len(tokens)}")
+                    # Парсим значения PULSE (V0 V1 TD TR TF TH TP N)
+                    v0 = float(tokens[0])
+                    v1 = float(tokens[1])
+                    # Время парсим через parse_time, чтобы поддержать единицы
+                    td = parse_time(tokens[2])
+                    tr = parse_time(tokens[3])
+                    tf = parse_time(tokens[4])
+                    th = parse_time(tokens[5]) # Это TH из PULSE
+                    tp_period = parse_time(tokens[6]) # Это T_PERIOD из PULSE
+                    n = int(tokens[7])
+
+                    if td < 0 or tr < 0 or tf < 0 or th < 0: raise ValueError("PULSE: Времена (TD, TR, TF, TH) не могут быть отрицательными")
+                    if n < 0: raise ValueError("PULSE: Число импульсов (N) не может быть отрицательным")
+
+                    # Рассчитываем TL из TP (периода)
+                    # TP_period = TR + TH + TF + TL
+                    tl = tp_period - (tr + th + tf)
+                    if tl < -1e-12: # Допускаем небольшую погрешность вычислений
+                         # Если TL отрицательный, возможно, данные некорректны
+                         raise ValueError(f"PULSE: Вычисленное значение TL ({fmt(tl)}) отрицательно (TP={fmt(tp_period)}, TR={fmt(tr)}, TH={fmt(th)}, TF={fmt(tf)}). Проверьте параметры.")
+                    else:
+                        tl = max(0, tl) # Убедимся, что не отрицательное из-за погрешности
+
+                    sig = Signal(V0=v0, V1=v1, TD=td, TR=tr, TF=tf, TH=th, TL=tl, N=n, Name=name)
+                    # pwl_points не устанавливаем, сигнал будет генерироваться по параметрам
+                    signals.append(sig)
+
+                elif data_part_upper.startswith("PWL(") and data_part_upper.endswith(")"):
+                    inner = data_part_orig[len("PWL("):-1].strip()
+                    tokens = inner.split()
+                    if not tokens: raise ValueError("PWL: Нет точек данных")
+                    if len(tokens) % 2 != 0: raise ValueError("PWL: Нечетное число значений (ожидаются пары время-напряжение)")
+
+                    pwl_times = []
+                    pwl_voltages = []
+                    last_t = -float('inf')
+                    for i in range(0, len(tokens), 2):
+                        t_str, v_str = tokens[i], tokens[i+1]
+                        try:
+                             # Время может быть без единиц (секунды) или с ними
+                             t_val = parse_time(t_str)
+                             v_val = float(v_str)     # Напряжение просто число
+                        except ValueError as e_pair:
+                             raise ValueError(f"PWL: Ошибка в паре '{t_str} {v_str}': {e_pair}")
+
+                        if t_val < last_t - 1e-15: # Допуск для сравнения
+                            raise ValueError(f"PWL: Время должно монотонно возрастать (нарушение: {fmt(t_val)} < {fmt(last_t)})")
+                        # Допускаем одинаковое время для вертикальных фронтов, обновляя напряжение
+                        if abs(t_val - last_t) < 1e-15 and pwl_times:
+                            pwl_voltages[-1] = v_val # Обновляем напряжение последней точки
+                        else:
+                            pwl_times.append(t_val)
+                            pwl_voltages.append(v_val)
+                            last_t = t_val # Обновляем только если время реально изменилось
+
+                    if len(pwl_times) < 1: raise ValueError("PWL: Необходимо минимум 1 точка данных")
+                    # Если первая точка не t=0, добавим ее с напряжением первой точки
+                    if pwl_times[0] > 1e-15:
+                        pwl_times.insert(0, 0.0)
+                        pwl_voltages.insert(0, pwl_voltages[0])
+
+                    # Создаем "пустой" сигнал PULSE, т.к. не можем надежно восстановить параметры
+                    v0_pwl = pwl_voltages[0]
+                    v1_pwl = v0_pwl
+                    for v in pwl_voltages:
+                        if abs(v - v0_pwl) > 1e-9: v1_pwl = v; break
+
+                    # Создаем базовый сигнал (параметры будут игнорироваться при отрисовке, т.к. есть pwl_points)
+                    sig = Signal(V0=v0_pwl, V1=v1_pwl, TD=0, TR=1e-9, TF=1e-9, TH=0, TL=0, N=0, Name=name)
+                    # Сразу устанавливаем PWL точки (set_pwl_points вызовет _update_time_scale_from_pwl)
+                    sig.set_pwl_points(pwl_times, pwl_voltages)
+                    signals.append(sig)
+
+                else:
+                    raise ValueError("Неизвестный формат: строка должна начинаться с 'Имя:PULSE(...)' или 'Имя:PWL(...)'")
+
+            except Exception as ex:
+                errors.append(f"Строка {lineno}: {line}\n  Ошибка: {ex}")
+
+        return signals, errors
+
+    def _parse_tabular_data(self, data_iterator, source_name) -> tuple[list[Signal], list[str]]:
+        """Общий парсер для CSV и XLSX данных."""
+        signals = []
+        errors = []
+        header = None
+        signal_data = {} # {col_index: {'name': str, 'times': [], 'voltages': []}}
+        time_col_index = -1
+
+        for row_idx, row in enumerate(data_iterator):
+            # Пропускаем пустые строки (особенно актуально для XLSX)
+            if not any(cell is not None and str(cell).strip() != '' for cell in row):
+                 continue
+
+            if header is None: # Первая непустая строка - заголовок
+                header = [str(h).strip() if h is not None else "" for h in row]
+                # Ищем колонку времени (регистронезависимо)
+                time_col_name = 'Time (s)'
+                try:
+                    # Ищем точное совпадение или регистронезависимое
+                    found = False
+                    for idx, h in enumerate(header):
+                        if h == time_col_name or h.lower() == time_col_name.lower():
+                            time_col_index = idx
+                            found = True
+                            break
+                    if not found:
+                         errors.append(f"Не найдена колонка времени '{time_col_name}' в заголовке: {header}")
+                         return signals, errors # Критическая ошибка
+                except ValueError:
+                     errors.append(f"Не найдена колонка времени '{time_col_name}' в заголовке: {header}")
+                     return signals, errors # Критическая ошибка
+
+                # Инициализируем структуры для сигналов
+                for col_idx, signal_name in enumerate(header):
+                    if col_idx != time_col_index and signal_name: # Игнорируем колонку времени и пустые заголовки
+                        signal_data[col_idx] = {'name': signal_name, 'times': [], 'voltages': []}
+                if not signal_data:
+                    errors.append("Не найдено ни одной колонки с именами сигналов в заголовке.")
+                    return signals, errors
+                continue # Переходим к следующей строке (данным)
+
+            # --- Обработка строк данных ---
+            if len(row) <= time_col_index:
+                errors.append(f"Строка {row_idx + 1}: Недостаточно колонок для чтения времени (ожидалось {time_col_index + 1}, получено {len(row)}).")
+                continue # Пропускаем строку
+
+            time_val_raw = row[time_col_index]
+            try:
+                # Время в CSV/XLSX всегда в секундах (как при экспорте)
+                time_val = float(time_val_raw)
+                if time_val < 0:
+                     raise ValueError("Время не может быть отрицательным")
+            except (ValueError, TypeError) as e:
+                errors.append(f"Строка {row_idx + 1}, колонка времени ({header[time_col_index]}): Неверное значение '{time_val_raw}' ({e}).")
+                continue # Пропускаем строку, если время невалидно
+
+            # Читаем напряжения для каждого сигнала
+            for col_idx, sig_info in signal_data.items():
+                if len(row) <= col_idx:
+                    errors.append(f"Строка {row_idx + 1}: Недостаточно колонок для сигнала '{sig_info['name']}' (ожидалось {col_idx + 1}, получено {len(row)}).")
+                    # Добавляем NaN или пропускаем? Пока пропускаем точку для этого сигнала
+                    continue
+
+                voltage_val_raw = row[col_idx]
+                try:
+                    voltage_val = float(voltage_val_raw)
+                except (ValueError, TypeError) as e:
+                    errors.append(f"Строка {row_idx + 1}, колонка '{sig_info['name']}': Неверное значение напряжения '{voltage_val_raw}' ({e}).")
+                    # Используем NaN, чтобы обозначить пропуск? Или последнее известное значение?
+                    # Пока просто пропустим добавление этой точки для этого сигнала
+                    continue # Пропускаем эту точку для данного сигнала
+
+                sig_info['times'].append(time_val)
+                sig_info['voltages'].append(voltage_val)
+
+        # --- Создание объектов Signal из собранных данных ---
+        if not header:
+            errors.append("Не найден заголовок в файле.")
+            return signals, errors
+
+        for col_idx, sig_info in signal_data.items():
+            name = sig_info['name']
+            times = sig_info['times']
+            voltages = sig_info['voltages']
+
+            if not times:
+                errors.append(f"Сигнал '{name}': Не найдено валидных точек данных.")
+                continue
+
+            # Проверка монотонности времени (данные должны быть отсортированы по времени при экспорте)
+            last_t = -float('inf')
+            valid_times = []
+            valid_voltages = []
+            has_non_monotonic = False
+            for t, v in zip(times, voltages):
+                 if t < last_t - 1e-15:
+                     has_non_monotonic = True
+                     break # Нашли нарушение
+                 # Допускаем одинаковое время - берем последнюю точку
+                 if abs(t - last_t) < 1e-15 and valid_times:
+                      valid_voltages[-1] = v
+                 else:
+                      valid_times.append(t)
+                      valid_voltages.append(v)
+                      last_t = t
+            if has_non_monotonic:
+                 errors.append(f"Сигнал '{name}': Данные времени не монотонно возрастают. Сигнал может быть некорректен.")
+                 # Продолжаем с тем, что есть, но предупреждаем
+
+            times = valid_times
+            voltages = valid_voltages
+
+            if not times: # Если после фильтрации ничего не осталось
+                 errors.append(f"Сигнал '{name}': Не осталось валидных точек после проверки монотонности.")
+                 continue
+
+            # Если первая точка не t=0, добавим ее
+            if times[0] > 1e-15:
+                times.insert(0, 0.0)
+                voltages.insert(0, voltages[0]) # Используем напряжение первой точки
+
+            # Создаем Signal с PWL данными
+            v0_pwl = voltages[0]
+            v1_pwl = v0_pwl
+            for v in voltages:
+                if abs(v - v0_pwl) > 1e-9: v1_pwl = v; break
+
+            sig = Signal(V0=v0_pwl, V1=v1_pwl, TD=0, TR=1e-9, TF=1e-9, TH=0, TL=0, N=0, Name=name)
+            sig.set_pwl_points(times, voltages) # Устанавливаем PWL
+            signals.append(sig)
+
+        return signals, errors
+
+    def _load_csv(self, filepath) -> tuple[list[Signal], list[str]]:
+        """Загружает сигналы из CSV файла."""
+        try:
+            # Пробуем определить диалект CSV (разделитель)
+            with open(filepath, 'r', newline='', encoding='utf-8') as csvfile:
+                try:
+                     dialect = csv.Sniffer().sniff(csvfile.read(1024*5)) # Читаем больше для надежности
+                     csvfile.seek(0) # Возвращаемся к началу файла
+                     reader = csv.reader(csvfile, dialect)
+                     print(f"Detected CSV dialect: delimiter='{dialect.delimiter}', quotechar='{dialect.quotechar}'")
+                except csv.Error:
+                     # Если определить не удалось, используем стандартный разделитель ','
+                     print("CSV dialect detection failed, using default delimiter=','")
+                     csvfile.seek(0)
+                     reader = csv.reader(csvfile, delimiter=',')
+
+                # Передаем итератор reader в общий парсер
+                return self._parse_tabular_data(reader, os.path.basename(filepath))
+
+        except IOError as e:
+            return [], [f"Не удалось прочитать CSV файл: {e}"]
+        except Exception as e:
+            import traceback
+            return [], [f"Неожиданная ошибка при чтении CSV: {e}\n{traceback.format_exc()}"]
+
+
+    def _load_xlsx(self, filepath) -> tuple[list[Signal], list[str]]:
+        """Загружает сигналы из XLSX файла."""
+        if not XLSX_SUPPORT: # Двойная проверка
+            return [], ["Библиотека openpyxl не найдена."]
+        try:
+            wb = load_workbook(filename=filepath, read_only=True, data_only=True) # data_only=True для чтения значений формул
+            # ws = wb.active # Берем активный лист
+            # Или первый лист, что надежнее, если активный пустой
+            ws = wb[wb.sheetnames[0]]
+            # iter_rows(values_only=True) возвращает кортежи значений строк
+            data_iterator = ws.iter_rows(values_only=True)
+            return self._parse_tabular_data(data_iterator, os.path.basename(filepath))
+        except FileNotFoundError:
+            return [], [f"XLSX файл не найден: {filepath}"]
+        except Exception as e:
+            import traceback
+            return [], [f"Ошибка при чтении XLSX файла: {e}\n{traceback.format_exc()}"]
+
 
 
 # ───── Запуск приложения ─────
@@ -1459,7 +1956,7 @@ def main():
             root.option_add("*Font", default_font)
             ttk.Style().theme_use('vista') # или 'xpnative', 'winnative'
         except Exception:
-             print("Windows theme not available, using default.") # Оставляем clam по умолчанию
+             print("Windows theme not available, using default 'clam'.") # Оставляем clam по умолчанию
 
         app = PulseApp(root)
         root.mainloop()
@@ -1467,14 +1964,18 @@ def main():
         import traceback
         # Используем tk окно для ошибки, если Tkinter еще работает
         try:
-             root = tk.Tk()
-             root.withdraw() # Скрываем основное окно
-             messagebox.showerror("Критическая ошибка", f"Произошла ошибка при запуске:\n{e}\n\n{traceback.format_exc()}")
-        except:
+             root_err = tk.Tk()
+             root_err.withdraw() # Скрываем основное окно
+             messagebox.showerror("Критическая ошибка приложения", f"Произошла неперехваченная ошибка:\n{e}\n\n{traceback.format_exc()}", parent=None)
+             root_err.destroy()
+        except Exception as tk_err:
             # Если Tkinter совсем не работает, выводим в консоль
-            print("Критическая ошибка:")
+            print("Критическая ошибка приложения (Tkinter недоступен для отображения):")
             print(e)
             print(traceback.format_exc())
+            print("\nОшибка Tkinter при попытке показать сообщение:")
+            print(tk_err)
+
 
 if __name__ == '__main__':
     main()
